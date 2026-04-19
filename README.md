@@ -48,7 +48,7 @@ GOOS=linux GOARCH=amd64 go build -o gofi ./cmd/gofi
 sudo ./gofi
 ```
 
-Sudo is strongly recommended — many log files, socket listings, and vulnerability checks require root.
+Sudo is recommended — as many log files, socket listings, and vulnerability checks require root.
 
 ### Windows
 
