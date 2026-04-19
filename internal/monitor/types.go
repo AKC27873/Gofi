@@ -2,7 +2,7 @@ package monitor
 
 import "time"
 
-// a security alert
+// Alert represents a security alert
 type Alert struct {
 	Message   string
 	Timestamp time.Time
@@ -10,7 +10,7 @@ type Alert struct {
 	Category  string // "process", "log", "network", "vuln"
 }
 
-// Running processes on the systems
+// Process represents a running process
 type Process struct {
 	PID      int32
 	Name     string
@@ -19,14 +19,14 @@ type Process struct {
 	Memory   float32
 }
 
-// represent a parsed log line
+// LogEntry represents a parsed log line
 type LogEntry struct {
 	Message   string
 	Source    string
 	Timestamp time.Time
 }
 
-// represent a detected vulnerability
+// Vulnerability represents a detected vulnerability
 type Vulnerability struct {
 	Type      string `json:"type"`
 	Details   string `json:"details"`
@@ -34,7 +34,7 @@ type Vulnerability struct {
 	Timestamp string `json:"timestamp"`
 }
 
-// listening for open ports on the system.
+// OpenPort represents a listening port on the system
 type OpenPort struct {
 	Protocol      string
 	Port          string
@@ -43,25 +43,25 @@ type OpenPort struct {
 	Vulnerability string
 }
 
-// Outbound connections for network connections
+// NetworkConnection represents an outbound connection
 type NetworkConnection struct {
 	LocalAddr  string
 	RemoteAddr string
-	RemoteHost string // resolve hostname if available
+	RemoteHost string // resolved hostname if available
 	Status     string
 	PID        int32
 	Process    string
 	Timestamp  time.Time
 }
 
-// Vulnerable Log rules holds the log detection rules
+// VulnerableRule holds log detection rules
 type LogRule struct {
-	Pattern     string `yaml: "pattern"`
-	Description string `yaml: "description"`
-	Severity    string `yaml: "severity"`
+	Pattern     string `yaml:"pattern"`
+	Description string `yaml:"description"`
+	Severity    string `yaml:"severity"`
 }
 
-// YAML rules file struct
+// RulesConfig represents the YAML rules file
 type RulesConfig struct {
-	Rules []LogRule `yaml: "rules"`
+	Rules []LogRule `yaml:"rules"`
 }

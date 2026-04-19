@@ -5,21 +5,23 @@ import (
 	"time"
 )
 
+// Store is a thread-safe container for all monitoring data
 type Store struct {
-	mu             sync.RWMutex
-	alerts         []Alert
-	processes      []Process
-	logs           []LogEntry
-	vulnerabilites []Vulnerability
-	openPorts      []OpenPort
-	connections    []NetworkConnection
+	mu              sync.RWMutex
+	alerts          []Alert
+	processes       []Process
+	logs            []LogEntry
+	vulnerabilities []Vulnerability
+	openPorts       []OpenPort
+	connections     []NetworkConnection
 
-	// Track for brute force detection
+	// Tracking for brute force detection
 	failedLogins map[string]int
 }
 
+// NewStore creates a new Store
 func NewStore() *Store {
-	return &store{
+	return &Store{
 		alerts:          make([]Alert, 0, 500),
 		processes:       make([]Process, 0, 200),
 		logs:            make([]LogEntry, 0, 1000),
@@ -30,7 +32,7 @@ func NewStore() *Store {
 	}
 }
 
-// AddAlert appends an alert and also trims if needed
+// AddAlert appends an alert, trimming if needed
 func (s *Store) AddAlert(a Alert) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -43,7 +45,7 @@ func (s *Store) AddAlert(a Alert) {
 	}
 }
 
-// Alerts returns a copy of all the alerts
+// Alerts returns a copy of all alerts
 func (s *Store) Alerts() []Alert {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -52,7 +54,7 @@ func (s *Store) Alerts() []Alert {
 	return out
 }
 
-// Replacing the process lists
+// SetProcesses replaces the process list
 func (s *Store) SetProcesses(p []Process) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -68,15 +70,17 @@ func (s *Store) Processes() []Process {
 	return out
 }
 
-func (s *Store) AddLog(LogEntry) {
+// AddLog appends a log entry
+func (s *Store) AddLog(l LogEntry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.logs = append(s.logs)
+	s.logs = append(s.logs, l)
 	if len(s.logs) > 2000 {
 		s.logs = s.logs[len(s.logs)-2000:]
 	}
 }
 
+// Logs returns a copy of log entries
 func (s *Store) Logs() []LogEntry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -85,29 +89,30 @@ func (s *Store) Logs() []LogEntry {
 	return out
 }
 
-// Replaces the vulnerability list
+// SetVulnerabilities replaces the vulnerability list
 func (s *Store) SetVulnerabilities(v []Vulnerability) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.vulnerabilites = v
+	s.vulnerabilities = v
 }
 
-// Returns a copy of vulnerabilites
-func (s *Store) Vulnerabilites() []Vulnerability {
+// Vulnerabilities returns a copy of vulnerabilities
+func (s *Store) Vulnerabilities() []Vulnerability {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]Vulnerability, len(s.vulnerabilites))
-	copy(out, s.vulnerabilites)
+	out := make([]Vulnerability, len(s.vulnerabilities))
+	copy(out, s.vulnerabilities)
 	return out
 }
 
-// Replaces the open port lists
+// SetOpenPorts replaces the open port list
 func (s *Store) SetOpenPorts(p []OpenPort) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.openPorts = p
 }
 
+// OpenPorts returns a copy of open ports
 func (s *Store) OpenPorts() []OpenPort {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -116,12 +121,14 @@ func (s *Store) OpenPorts() []OpenPort {
 	return out
 }
 
+// SetConnections replaces the connection list
 func (s *Store) SetConnections(c []NetworkConnection) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.connections = c
 }
 
+// Connections returns a copy of network connections
 func (s *Store) Connections() []NetworkConnection {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -130,6 +137,7 @@ func (s *Store) Connections() []NetworkConnection {
 	return out
 }
 
+// IncFailedLogin tracks a failed login from the given IP and returns new count
 func (s *Store) IncFailedLogin(ip string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
