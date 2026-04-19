@@ -2,7 +2,7 @@
 
 Real-time security monitoring with a Bubble Tea TUI. Cross-platform: runs on Linux and Windows.
 
-A port (and rewrite) of the Python `unified` tool — same philosophy, different stack, no plugin system.
+A port (and rewrite) of the Python `unified` tool — same philosophy, different stack, no plugin system (I am planning on adding this later).
 
 ## Features
 
