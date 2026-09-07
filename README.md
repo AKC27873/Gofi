@@ -50,16 +50,6 @@ sudo ./gofi
 
 Sudo is recommended — as many log files, socket listings, and vulnerability checks require root.
 
-### Windows
-
-Open an **elevated** (Administrator) PowerShell or cmd, then:
-
-```powershell
-.\gofi.exe
-```
-
-Without admin, the Security event channel won't be readable, Defender/firewall queries return nothing, and some pending-update counts may be off.
-
 ## Keybindings
 
 | Key                       | Action           |
