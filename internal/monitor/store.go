@@ -5,10 +5,19 @@ import (
 	"time"
 )
 
-// Store is a thread-safe container for all monitoring data
+const (
+	DefaultMaxAlerts   = 1000
+	DefaultMaxLogs     = 2000
+	DefaultDedupWindow = 5 * time.Minute
+
+	BruteForceWindow = 15 * time.Minute
+)
+
 type Store struct {
 	mu              sync.RWMutex
-	alerts          []Alert
+	alerts          []*Alert
+	alertIdx        map[string]*Alert
+	supressed       int
 	processes       []Process
 	logs            []LogEntry
 	vulnerabilities []Vulnerability
@@ -16,19 +25,46 @@ type Store struct {
 	connections     []NetworkConnection
 
 	// Tracking for brute force detection
-	failedLogins map[string]int
+	failedLogins map[string][]time.Time
+	maxAlerts    int
+	maxLogs      int
+	dedupWindow  time.Duration
+	bruteWindow  time.Duration
 }
 
 // NewStore creates a new Store
 func NewStore() *Store {
 	return &Store{
-		alerts:          make([]Alert, 0, 500),
-		processes:       make([]Process, 0, 200),
-		logs:            make([]LogEntry, 0, 1000),
-		vulnerabilities: make([]Vulnerability, 0, 200),
-		openPorts:       make([]OpenPort, 0, 100),
-		connections:     make([]NetworkConnection, 0, 200),
-		failedLogins:    make(map[string]int),
+		alerts:          make([]*Alert, 0, 256),
+		alertIdx:        make(map[string]*Alert),
+		processes:       make([]Process, 0, 256),
+		logs:            make([]LogEntry, 0, 512),
+		vulnerabilities: make([]Vulnerability, 0, 64),
+		openPorts:       make([]OpenPort, 0, 64),
+		connections:     make([]NetworkConnection, 0, 128),
+		failedLogins:    make(map[string][]time.Time),
+		maxAlerts:       DefaultMaxAlerts,
+		maxLogs:         DefaultMaxLogs,
+		dedupWindow:     DefaultDedupWindow,
+		bruteWindow:     BruteForceWindow,
+	}
+}
+
+func (s *Store) SetDedupWindow(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dedupWindow = d
+}
+
+func (s *Store) SetLimits(maxAlerts, maxLogs int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if maxAlerts > 0 {
+		s.maxAlerts = maxAlerts
+	}
+	if maxLogs > 0 {
+		s.maxLogs = maxLogs
 	}
 }
 
@@ -36,22 +72,71 @@ func NewStore() *Store {
 func (s *Store) AddAlert(a Alert) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	now := time.Now()
+
 	if a.Timestamp.IsZero() {
-		a.Timestamp = time.Now()
+		a.Timestamp = now
 	}
-	s.alerts = append(s.alerts, a)
-	if len(s.alerts) > 1000 {
-		s.alerts = s.alerts[len(s.alerts)-1000:]
+	a.LastSeen = a.Timestamp
+	a.count = 1
+	a.Key = a.DedupKey()
+
+	window := s.dedupWindow
+	if a.DedupWindow > 0 {
+		window = a.DedupWindow
 	}
+
+	if window > 0 {
+		if existing, ok := s.alertIdx[a.Key]; ok && a.Timestamp.Sub(existing.LastSeen) <= window {
+			existing.Count++
+			existing.LastSeen = a.Timestamp
+
+			if a.Severity.Rank() > existing.Severity.Rank() {
+				existing.Severity = a.Severity
+			}
+			s.supressed++
+			return
+		}
+	}
+	rec := a
+	s.alerts = append(s.alerts, &rec)
+	s.alertIdx[rec.Key] = &rec
+	s.trimAlertsLocked()
+}
+
+func (s *Store) trimAlertsLocked() {
+	if len(s.alerts) <= s.maxAlerts {
+		return
+	}
+	drop := len(s.alerts) - s.maxAlerts
+	for _, a := range s.alerts[:drop] {
+		if cur, ok := s.alertIdx[a.Key]; ok && cur == a {
+			delete(s.alertIdx, a.Key)
+		}
+	}
+	s.alerts = append(s.alerts[:0], s.alerts[drop:]...)
 }
 
 // Alerts returns a copy of all alerts
 func (s *Store) Alerts() []Alert {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.alertsLocked()
+}
+
+func (s *Store) alertsLocked() []Alert {
 	out := make([]Alert, len(s.alerts))
-	copy(out, s.alerts)
+	for i, a := range s.alerts {
+		out[i] = *a
+	}
 	return out
+}
+
+func (s *Store) SuppressedCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.supressed
 }
 
 // SetProcesses replaces the process list
@@ -74,9 +159,14 @@ func (s *Store) Processes() []Process {
 func (s *Store) AddLog(l LogEntry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.logs = append(s.logs, l)
-	if len(s.logs) > 2000 {
-		s.logs = s.logs[len(s.logs)-2000:]
+	if l.Timestamp.IsZero() {
+		l.Timestamp = time.Now()
+	}
+	s.logs = append(s.logs, 1)
+
+	if len(s.logs) > s.maxLogs {
+		drop := len(s.logs) - s.maxLogs
+		s.logs = append(s.logs[:0], s.logs[drop:]...)
 	}
 }
 
@@ -137,10 +227,63 @@ func (s *Store) Connections() []NetworkConnection {
 	return out
 }
 
-// IncFailedLogin tracks a failed login from the given IP and returns new count
-func (s *Store) IncFailedLogin(ip string) int {
+func (s *Store) RecordFailedLogin(ip string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.failedLogins[ip]++
-	return s.failedLogins[ip]
+
+	now := time.Now()
+	cutoff := now.Add(-s.bruteWindow)
+
+	hits := s.failedLogins[ip]
+	kept := hits[:0]
+
+	for _, t := range hits {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	kept = append(kept, now)
+	s.failedLogins[ip] = kept
+
+	if len(s.failedLogins) > 4096 {
+		for k, v := range s.failedLogins {
+			if len(v) == 0 || v[len(v)-1].Before(cutoff) {
+				delete(s.failedLogins, k)
+			}
+		}
+	}
+	return len(kept)
+}
+
+func (s *Store) Snapshot() Snapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	snap := Snapshot{
+		Taken:           time.Now(),
+		Alerts:          s.alertsLocked(),
+		Processes:       make([]Process, len(s.processes)),
+		Logs:            make([]LogEntry, len(s.logs)),
+		Vulnerabilities: make([]Vulnerability, len(s.vulnerabilities)),
+		OpenPorts:       make([]OpenPort, len(s.openPorts)),
+		Connections:     make([]NetworkConnection, len(s.connections)),
+		Supressed:       s.supressed,
+	}
+	copy(snap.Processes, s.processes)
+	copy(snap.Logs, s.logs)
+	copy(snap.Vulnerabilities, s.vulnerabilities)
+	copy(snap.OpenPorts, s.openPorts)
+	copy(snap.Connections, s.connections)
+	return snap
+}
+
+func (s Snapshot) WorstSeverity() Severity {
+	worst := SeverityInfo
+
+	for _, v := range s.Alerts {
+		if v.Severity.Rank() > worst.Rank() {
+			worst = v.Severity
+		}
+	}
+	return worst
 }

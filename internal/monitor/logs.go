@@ -9,90 +9,115 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"golang.org/x/vuln/scan"
 )
 
-// BruteForceThreshold is the number of failed logins from one IP before alerting
 const BruteForceThreshold = 5
 
-// LogMonitor tails log files (and, on Windows, polls the Event Log)
-// and applies detection rules to every incoming line.
-//
-// File-tailing logic is cross-platform — the OS-specific pieces live
-// in logs_linux.go and logs_windows.go.
+const maxPendingLine = 1 << 20
+
+const tailPollInterval = 500 * time.Millisecond
+
 type LogMonitor struct {
 	store *Store
 	rules []LogRule
 	files []string
+
+	journal bool
 }
 
-// NewLogMonitor creates a new LogMonitor for the given log files.
-// Files that don't exist or aren't readable are silently dropped.
 func NewLogMonitor(store *Store, rules []LogRule, files []string) *LogMonitor {
-	available := []string{}
+	available := make([]string, 0, len(files))
 	for _, f := range files {
-		if _, err := os.Stat(f); err == nil {
-			available = append(available, f)
+		fh, err := os.Open(f)
+		if err != nil {
+			if os.IsPermission(err) {
+				store.AddAlert(Alert{
+					Key:      "logaccess:" + f,
+					Message:  fmt.Sprintf("Cannot read %s (permission denied) — run with sudo or add your user to the admin group", f),
+					Severity: SeverityInfo,
+					Category: CategoryLog,
+				})
+			}
+			continue
 		}
+		fh.Close()
+		available = append(available, f)
 	}
-	return &LogMonitor{
-		store: store,
-		rules: rules,
-		files: available,
-	}
+	return &LogMonitor{store: store, rules: rules, files: available}
 }
 
-// tail follows a single file, reading new lines as they are appended.
-// Handles log rotation by detecting when the underlying file has changed
-// and reopening. Shared between Linux and Windows.
+func (lm *LogMonitor) SetJournal(v bool) { lm.journal = v }
+
+func (lm *LogMonitor) Files() []string { return lm.files }
+
 func (lm *LogMonitor) tail(ctx context.Context, path string) {
 	f, err := os.Open(path)
 	if err != nil {
 		return
 	}
+	defer func() { f.Close() }()
 
-	if _, err := f.Seek(0, io.SeekEnd); err != nil {
-		f.Close()
+	offset, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
 		return
 	}
-
 	reader := bufio.NewReader(f)
 	source := filepath.Base(path)
 
-	ticker := time.NewTicker(500 * time.Millisecond)
+	var pending strings.Builder
+
+	ticker := time.NewTicker(tailPollInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			f.Close()
 			return
 		case <-ticker.C:
 			for {
-				line, err := reader.ReadString('\n')
+				chunk, err := reader.ReadString('\n')
 				if err != nil {
+					if chunk != "" && pending.Len() < maxPendingLine {
+						pending.WriteString(chunk)
+					}
 					break
 				}
-				line = strings.TrimRight(line, "\n\r")
+				line := chunk
+
+				if pending.Len() > 0 {
+					line = pending.String() + chunk
+					pending.Reset()
+				}
+				line = strings.TrimRight(line, "\r\n")
 				if line == "" {
 					continue
 				}
+				offset += int64(len(chunk))
 				lm.processLine(line, source)
 			}
+			reopen := false
 			if rotated(f, path) {
-				f.Close()
+				reopen = true
+			} else if fi, err := f.Stat(); err == nil && fi.Size() < offset {
+				reopen = true
+			}
+			if reopen {
 				nf, err := os.Open(path)
 				if err != nil {
-					return
+					continue
 				}
+				f.Close()
 				f = nf
+				offset = 0
 				reader = bufio.NewReader(f)
+				pending.Reset()
 			}
 		}
 	}
 }
 
-// rotated reports whether the currently-open file is no longer the one
-// at the given path (which happens when logrotate et al. move it aside).
 func rotated(f *os.File, path string) bool {
 	fi1, err1 := f.Stat()
 	fi2, err2 := os.Stat(path)
@@ -102,64 +127,137 @@ func rotated(f *os.File, path string) bool {
 	return !os.SameFile(fi1, fi2)
 }
 
-// processLine applies detection rules to a single log line.
-func (lm *LogMonitor) processLine(line, source string) {
-	entry := LogEntry{
-		Message:   line,
-		Source:    source,
-		Timestamp: time.Now(),
+func (lm *LogMonitor) tailJournal(ctx context.Context) {
+	cmd := journalCommand(ctx)
+	if cmd == nil {
+		return
 	}
-	lm.store.AddLog(entry)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
 
-	for _, rule := range lm.rules {
-		if strings.Contains(line, rule.Pattern) {
-			severity := rule.Severity
-			if severity == "" {
-				severity = "warning"
-			}
-			lm.store.AddAlert(Alert{
-				Message:   fmt.Sprintf("[%s] %s: %s", source, rule.Description, truncate(line, 180)),
-				Severity:  severity,
-				Category:  "log",
-				Timestamp: time.Now(),
-			})
+	scanner := bufio.NewScanner(stdout)
 
-			// Brute-force detection uses the same sshd-style "Failed password from <ip>" format.
-			// Windows-format failed logons are handled separately in the event log poller.
-			if rule.Pattern == "Failed password" {
-				lm.detectBruteForce(line)
-			}
+	scanner.Buffer(make([]byte, 0, 64*1024), maxPendingLine)
+
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" {
+			lm.processLine(line, "journal")
 		}
 	}
 }
 
-// detectBruteForce extracts a source IP from a "Failed password from ..." line
-// and raises an alert after crossing the threshold.
-func (lm *LogMonitor) detectBruteForce(line string) {
-	idx := strings.Index(line, "from ")
-	if idx < 0 {
-		return
-	}
-	rest := line[idx+len("from "):]
-	fields := strings.Fields(rest)
-	if len(fields) == 0 {
-		return
-	}
-	ip := fields[0]
-	count := lm.store.IncFailedLogin(ip)
-	if count == BruteForceThreshold {
+func (lm *LogMonitor) processLine(line, source string) {
+	now := time.Now()
+	lm.store.AddLog(LogEntry{Meassage: line, Source: source, Timestamp: now})
+
+	for i := range lm.rules {
+		rule := &lm.rules[i]
+		caps, matched := rule.Match(line)
+		if !matched {
+			continue
+		}
 		lm.store.AddAlert(Alert{
-			Message:   fmt.Sprintf("Brute force attempt detected from %s (%d failed attempts)", ip, count),
-			Severity:  "critical",
-			Category:  "log",
-			Timestamp: time.Now(),
+			Key:         "rule:" + rule.Description + "|" + source,
+			Message:     fmt.Sprintf("[%s] %s: %s", source, rule.Description, truncate(line, 180)),
+			Severity:    rule.Severity,
+			Category:    CategoryLog,
+			Timestamp:   now,
+			DedupWindow: rule.Cooldown,
 		})
+		if ip, ok := caps["ip"]; ok && ip != && ip != "-" {
+			lm.trackFailedLogin(ip, now)
+		}
 	}
+}
+
+func (lm *LogMonitor) trackFailedLogin(ip string, ts time.Time) {
+	count := lm.store.RecordFailedLogin(ip)
+	if count < BruteForceThreshold {
+		return
+	}
+	lm.store.AddAlert(Alert{
+		Key: "bruteforce:" + ip,
+		Message: fmt.Sprintf("Brute force attempt from %s (%d failed logins from: %s)", ip, count, BruteForceWindow),
+		Severity: SeverityCritical,
+		Category: CategoryLog,
+		TimeStamp: ts,
+	})
+}
+
+func (lm *LogMonitor) ScanRecent(maxLines int) {
+	for _, path := range lm.files {
+		lines, err := readLastLines(path, maxLines)
+		if err != nil {
+			continue
+		}
+		source := filepath.Base(path)
+		for _, line := range lines {
+			lm.processLine(line, source)
+		}
+	}
+}
+
+func readLastLines(path string, n int) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	// Capping at 4 GIB
+	window := int64(n) * 512
+	if window > 4<<20 {
+		window = 4<<20
+	}
+	start := fi.Size() - window
+	if start < 0 {
+		start = 0
+	}
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return nil, err
+	}
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxPendingLine)
+	lines := make([]string, 0, n)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	if start > 0 && len(lines) > 0 {
+		lines = lines[len(lines)-n:]
+	}
+	return lines, scanner.Err()
 }
 
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
+	for n > 0 && !utf8Start(s[n]) {
+		n--
+	}
 	return s[:n] + "..."
 }
+
+func utf8Start(b byte) bool {return b&0xC0 != 0x80}
+
+
+
