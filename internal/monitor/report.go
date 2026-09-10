@@ -3,6 +3,7 @@ package monitor
 import (
 	"encoding/csv"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"sort"
@@ -134,4 +135,23 @@ func (r Report) WriteCSV(w io.Writer) error {
 			return err
 		}
 	}
+	for _, p := range r.OpenPorts {
+		if p.Vulnerability == "" && !p.New {
+			continue
+		}
+		msg := fmt.Sprintf("%s/%d listening (%s)", p.Protocol, p.Port, p.Process)
+		if p.Vulnerability != "" {
+			msg += "-" + p.Vulnerability
+		}
+		if p.New {
+			msg += "[new change since baseline has been made.]"
+		}
+		if err := cw.Write([]string{
+			"port", string(SeverityWarning), "network", msg,
+			r.Generated.Format(time.RFC3339), r.Generated.Format(time.RFC3339), "1", "",
+		}); err != nil {
+			return err
+		}
+	}
+	return cw.Error()
 }
