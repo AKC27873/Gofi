@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -154,4 +155,96 @@ func (r Report) WriteCSV(w io.Writer) error {
 		}
 	}
 	return cw.Error()
+}
+
+func (r Report) WriteText(w io.Writer) error {
+	fmt.Fprintf(w, "gofi %s — %s — %s\n", r.GofiVer, r.Hostname, r.Generated.Format(time.RFC3339))
+	fmt.Fprintf(w, "scan took %dms\n\n", r.DurationMS)
+
+	fmt.Fprintf(w, "alerts: %d (%d critical, %d warning, %d info; %d repeats collapsed)\n",
+		r.Summary.Alerts, r.Summary.Critical, r.Summary.Warning, r.Summary.Info, r.Summary.Suppressed)
+	fmt.Fprintf(w, "vulnerabilities: %d\n", r.Summary.Vulnerabilities)
+	fmt.Fprintf(w, "listening ports: %d (%d risky, %d new since baseline)\n",
+		r.Summary.OpenPorts, r.Summary.RiskyPorts, r.Summary.NewPorts)
+	fmt.Fprintf(w, "outbound connections: %d\n", r.Summary.Connections)
+
+	notable := make([]Alert, 0, len(r.Alerts))
+	for _, a := range r.Alerts {
+		if a.Severity.Rank() >= SeverityWarning.Rank() {
+			notable = append(notable, a)
+		}
+	}
+	sort.SliceStable(notable, func(i, j int) bool {
+		return notable[i].Severity.Rank() > notable[j].Severity.Rank()
+	})
+	if len(notable) > 0 {
+		fmt.Fprintf(w, "\nnotable alerts:\n")
+		for _, a := range notable {
+			fmt.Fprintf(w, "[%-8s] %s\n", a.Severity, a.Display())
+		}
+	}
+	if len(r.Vulnerabilities) > 0 {
+		fmt.Fprintf(w, "\nfindings:\n")
+		for _, v := range r.Vulnerabilities {
+			fmt.Fprintf(w, "[%-8s] %s\n", v.Severity, v.Type, v.Details)
+			if v.Remediation != "" {
+				fmt.Fprintf(w, "             fix: %s\n", v.Remediation)
+			}
+		}
+	}
+	return nil
+}
+
+func ExitCode(worst, failOn Severity) int {
+	if worst.Rank() < failOn.Rank() {
+		return 0
+	}
+	switch worst {
+	case SeverityCritical:
+		return 2
+	case SeverityWarning:
+		return 1
+	default:
+		return 0
+	}
+}
+
+type OneShotOptions struct {
+	Store    *Store
+	Process  *ProcessMonitor
+	Network  *NetworkMonitor
+	Vulns    *VulnScanner
+	Logs     *LogMonitor
+	LogLines int
+
+	CPUSample time.Duration
+}
+
+func CollectOnce(ctx context.Context, opts OneShotOptions) Snapshot {
+	if opts.CPUSample <= 0 {
+		opts.CPUSample = time.Second
+	}
+	if opts.LogLines <= 0 {
+		opts.LogLines = 500
+	}
+	if opts.Process != nil {
+		opts.Process.Collect(ctx, true)
+	}
+	if opts.Logs != nil {
+		opts.Logs.ScanRecent(opts.LogLines)
+	}
+	if opts.Vulns != nil {
+		opts.Logs.Scan(ctx)
+	}
+	if opts.Network != nil {
+		opts.Logs.Collect(ctx)
+	}
+	if opts.Process != nil {
+		select {
+		case <-ctx.Done():
+		case <-time.After(opts.CPUSample):
+		}
+		opts.Process.Collect(ctx, false)
+	}
+	return opts.Store.Snapshot()
 }
