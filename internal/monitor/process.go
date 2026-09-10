@@ -8,29 +8,34 @@ import (
 	"github.com/shirou/gopsutil/v3/process"
 )
 
-// CPUAlertThreshold is the CPU percentage above which an alert is raised
 const CPUAlertThreshold = 85.0
 
-// ProcessMonitor polls the process list on an interval
+const MemAlertThreshold = 25.0
+
 type ProcessMonitor struct {
 	store    *Store
+	baseline *Baseline
 	interval time.Duration
-	alerted  map[int32]bool // track PIDs we've already alerted on to avoid spam
+
+	handles map[int32]*process.Process
 }
 
-// NewProcessMonitor creates a new ProcessMonitor
 func NewProcessMonitor(store *Store, interval time.Duration) *ProcessMonitor {
 	return &ProcessMonitor{
 		store:    store,
 		interval: interval,
-		alerted:  make(map[int32]bool),
+		handles:  make(map[int32]*process.Process),
 	}
 }
 
-// Run polls processes until ctx is cancelled
+func (pm *ProcessMonitor) WithBaseline(b *Baseline) *ProcessMonitor {
+	pm.baseline = b
+	return pm
+}
+
 func (pm *ProcessMonitor) Run(ctx context.Context) {
-	// Prime CPU percentages — gopsutil needs two reads for accurate CPU%
-	pm.collect()
+	pm.Collect(ctx, true)
+
 	ticker := time.NewTicker(pm.interval)
 	defer ticker.Stop()
 	for {
@@ -38,58 +43,84 @@ func (pm *ProcessMonitor) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			pm.collect()
+			pm.Collect(ctx, false)
 		}
 	}
 }
 
-func (pm *ProcessMonitor) collect() {
-	procs, err := process.Processes()
+func (pm *ProcessMonitor) Collect(ctx context.Context, priming bool) {
+	procs, err := process.ProcessesWithContext(ctx)
 	if err != nil {
 		return
 	}
+
 	result := make([]Process, 0, len(procs))
-	seen := make(map[int32]bool)
+	seen := make(map[int32]bool, len(procs))
+
 	for _, p := range procs {
-		name, err := p.Name()
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		seen[p.Pid] = true
+
+		h, ok := pm.handles[p.Pid]
+		if !ok {
+			h = p
+			pm.handles[p.Pid] = h
+		}
+		name, err := h.NameWithContext(ctx)
 		if err != nil {
+			delete(pm.handles, p.Pid)
 			continue
 		}
-		username, _ := p.Username()
-		cpu, _ := p.CPUPercent()
-		mem, _ := p.MemoryPercent()
+		username, _ := h.UsernameWithContext(ctx)
+		cpu, _ := h.Percent(0)
+		mem, _ := h.MemoryPercentWithContext(ctx)
 
-		proc := Process{
+		result = append(result, Process{
 			PID:      p.Pid,
 			Name:     name,
 			Username: username,
 			CPU:      cpu,
 			Memory:   mem,
-		}
-		result = append(result, proc)
-		seen[p.Pid] = true
+		})
 
-		// Alert on high CPU, but only once per PID until it drops
+		if priming {
+			continue
+		}
+		if pm.baseline.ObserveProcess(name) {
+			pm.store.AddAlert(Alert{
+				Key:       "baseline:process:" + name,
+				Message:   fmt.Sprintf("New process not in baseline: %s (PID %d, user %s)", name, p.Pid, username),
+				Severity:  SeverityInfo,
+				Category:  CategoryBaseline,
+				Timestamp: time.Now(),
+			})
+		}
 		if cpu > CPUAlertThreshold {
-			if !pm.alerted[p.Pid] {
-				pm.store.AddAlert(Alert{
-					Message: fmt.Sprintf("High CPU usage by %s (PID: %d, CPU: %.1f%%)",
-						name, p.Pid, cpu),
-					Severity:  "warning",
-					Category:  "process",
-					Timestamp: time.Now(),
-				})
-				pm.alerted[p.Pid] = true
-			}
-		} else {
-			delete(pm.alerted, p.Pid)
+			pm.store.AddAlert(Alert{
+				Key:       fmt.Sprintf("cpu:%d:%s", p.Pid, name),
+				Message:   fmt.Sprintf("High CPU usage by %s (PID %d, CPU %.1f%%)", name, p.Pid, cpu),
+				Severity:  SeverityWarning,
+				Category:  CategoryProcess,
+				Timestamp: time.Now(),
+			})
+		}
+		if mem > MemAlertThreshold {
+			pm.store.AddAlert(Alert{
+				Key:       fmt.Sprintf("mem:%d:%s", p.Pid, name),
+				Message:   fmt.Sprintf("High memory usage by %s (PID %d, MEM %.1f%%)", name, p.Pid, mem),
+				Severity:  SeverityWarning,
+				Category:  CategoryProcess,
+				Timestamp: time.Now(),
+			})
 		}
 	}
-
-	// Clean up alerted map — remove PIDs that no longer exist
-	for pid := range pm.alerted {
+	for pid := range pm.handles {
 		if !seen[pid] {
-			delete(pm.alerted, pid)
+			delete(pm.handles, pid)
 		}
 	}
 
