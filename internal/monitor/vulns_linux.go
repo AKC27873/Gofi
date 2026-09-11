@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -147,39 +148,135 @@ func checkSSHConfig(ctx context.Context, ts time.Time) []Vulnerability {
 	}
 	var out []Vulnerability
 
-	if v, ok := settings["permitrootlogin"] {
-
+	if v, ok := settings["permitrootlogin"]; ok && strings.EqualFold(v, "yes") {
+		out = append(out, Vulnerability{
+			ID:          "ssh:permitrootlogin",
+			Type:        "root_login_ssh",
+			Details:     "SSH permits direct root login (PermitRootLogin yes)",
+			Remediation: "Set PermitRootLogin prohibit-password in sshd_config",
+			Severity:    SeverityCritical,
+			Timestamp:   ts,
+		})
 	}
+	if v, ok := settings["passwordauthentication"]; ok && strings.EqualFold(v, "yes") {
+		out = append(out, Vulnerability{
+			ID:          "ssh:passwordauth",
+			Type:        "ssh_password_auth",
+			Details:     "SSH accepts password authentication, exposing the host to credential stuffing",
+			Remediation: "Set PasswordAuthentication no and use key-based auth",
+			Severity:    SeverityWarning,
+			Timestamp:   ts,
+		})
+	}
+	if v, ok := settings["permitemptypasswords"]; ok && strings.EqualFold(v, "yes") {
+		out = append(out, Vulnerability{
+			ID:          "ssh:emptypasswords",
+			Type:        "ssh_empty_passwords",
+			Details:     "SSH permits empty passwords (PermitEmptyPasswords yes)",
+			Remediation: "Set PermitEmptyPasswords no in sshd_config",
+			Severity:    SeverityCritical,
+			Timestamp:   ts,
+		})
+	}
+	if v, ok := settings["x11forwarding"]; ok && strings.EqualFold(v, "yes") {
+		out = append(out, Vulnerability{
+			ID:          "ssh:x11forwarding",
+			Type:        "ssh_x11_forwarding",
+			Details:     "SSH X11 forwarding is enabled",
+			Remediation: "Set X11Forwarding no unless you need it",
+			Severity:    SeverityInfo,
+			Timestamp:   ts,
+		})
+	}
+	if v, ok := settings["maxauthtries"]; ok {
+		if n, err := strconv.Atoi(strings.Fields(v)[0]); err == nil && n > 6 {
+			out = append(out, Vulnerability{
+				ID:          "ssh:maxauthtries",
+				Type:        "ssh_weak_limits",
+				Details:     fmt.Sprintf("SSH MaxAuthTries is %d, which eases brute forcing", n),
+				Remediation: "Set MaxAuthTries 4 in sshd_config",
+				Severity:    SeverityInfo,
+				Timestamp:   ts,
+			})
+		}
+	}
+	return out
 }
 
-func checkPasswordPolicy(ts string) []Vulnerability {
-	path := "/etc/login.defs"
-	f, err := os.Open(path)
+func checkPasswordPolicy(ts time.Time) []Vulnerability {
+	f, err := os.Open("/etc/login.defs")
 	if err != nil {
 		return nil
 	}
 	defer f.Close()
 
+	var out []Vulnerability
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "PASS_MIN_LEN") {
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				var minLen int
-				fmt.Sscanf(fields[1], "%d", &minLen)
-				if minLen < PasswordMinLength {
-					return []Vulnerability{{
-						Type:      "weak_password_policy",
-						Details:   fmt.Sprintf("PASS_MIN_LEN is %d (recommended >= %d)", minLen, PasswordMinLength),
-						Severity:  "warning",
-						Timestamp: ts,
-					}}
-				}
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		switch fields[0] {
+		case "PASS_MIN_LEN":
+			if n, err := strconv.Atoi(fields[1]); err == nil && n < PasswordMinLength {
+				out = append(out, Vulnerability{
+					ID:          "policy:pass_min_len",
+					Type:        "weak_password_policy",
+					Details:     fmt.Sprintf("PASS_MIN_LEN is %d (recommended >= %d)", n, PasswordMinLength),
+					Remediation: fmt.Sprintf("Set PASS_MIN_LEN %d in /etc/login.defs", PasswordMinLength),
+					Severity:    SeverityWarning,
+					Timestamp:   ts,
+				})
+			}
+		case "PASS_MAX_DAYS":
+			if n, err := strconv.Atoi(fields[1]); err == nil && n > 365 {
+				out = append(out, Vulnerability{
+					ID:          "policy:pass_max_days",
+					Type:        "weak_password_policy",
+					Details:     fmt.Sprintf("PASS_MAX_DAYS is %d; passwords effectively never expire", n),
+					Remediation: "Set PASS_MAX_DAYS 90 in /etc/login.defs",
+					Severity:    SeverityInfo,
+					Timestamp:   ts,
+				})
 			}
 		}
 	}
-	return nil
+	return out
+}
+
+func checkEmptyPasswords(ts time.Time) []Vulnerability {
+	f, err := os.Open("/etc/shadow")
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var out []Vulnerability
+
+	scanner := bufio.NewScanner(f)
+
+	for scanner.Scan() {
+		fields := strings.Split(scanner.Text(), ":")
+		if len(fields) < 2 {
+			continue
+		}
+		if fields[1] == "" {
+			out = append(out, Vulnerability{
+				ID:          "account:emptypw" + fields[0],
+				Type:        "empty_passwor",
+				Details:     fmt.Sprintf("Account %q has no password set", fields[0]),
+				Remediation: fmt.Sprintf("passwd -l %s", fields[0]),
+				Severity:    SeverityCritical,
+				Timestamp:   ts,
+			})
+		}
+	}
+	return out
 }
 
 func checkUnnecessaryServices(ts string) []Vulnerability {
@@ -187,6 +284,7 @@ func checkUnnecessaryServices(ts string) []Vulnerability {
 	if _, err := exec.LookPath("systemctl"); err != nil {
 		return nil
 	}
+
 	for _, svc := range UnnecessaryServices {
 		cmd := exec.Command("systemctl", "is-active", svc)
 		output, _ := cmd.Output()
