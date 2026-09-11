@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -93,33 +94,62 @@ func checkFilePermissions(ts time.Time) []Vulnerability {
 	return out
 }
 
-func checkSSHRootLogin(ts string) []Vulnerability {
-	path := "/etc/ssh/sshd_config"
-	f, err := os.Open(path)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
+func sshdSettings(ctx context.Context) map[string]string {
+	settings := map[string]string{}
 
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "#") || line == "" {
-			continue
-		}
-		if strings.HasPrefix(strings.ToLower(line), "permitrootlogin") {
-			fields := strings.Fields(line)
-			if len(fields) >= 2 && strings.EqualFold(fields[1], "yes") {
-				return []Vulnerability{{
-					Type:      "root_login_ssh",
-					Details:   "PermitRootLogin yes is set in sshd_config",
-					Severity:  "critical",
-					Timestamp: ts,
-				}}
+	if commandExists("sshd") {
+		if out, err := runCommand(ctx, "sshd", "-T"); err == nil {
+			for _, line := range nonEmptyLine(out) {
+				parts := strings.SplitN(line, " ", 2)
+				if len(parts) == 2 {
+					settings[strings.ToLower(parts[0])] = strings.TrimSpace(parts[1])
+				}
+			}
+			if len(settings) > 0 {
+				return settings
 			}
 		}
 	}
-	return nil
+	paths := []string{"/etc/ssh/sshd_config"}
+	if extra, err := filepath.Glob("/etc/ssh/sshd_config.d/*.conf"); err == nil {
+		paths = append(paths, extra...)
+	}
+	for _, p := range paths {
+		f, err := os.Open(p)
+		if err != nil {
+			continue
+		}
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			key := strings.ToLower(fields[0])
+
+			if _, seen := settings[keys]; !seen {
+				settings[keys] = strings.Join(fields[1:], " ")
+			}
+		}
+		f.Close()
+	}
+	return settings
+}
+
+func checkSSHConfig(ctx context.Context, ts time.Time) []Vulnerability {
+	settings := sshdSettings(ctx)
+	if len(settings) == 0 {
+		return nil
+	}
+	var out []Vulnerability
+
+	if v, ok := settings["permitrootlogin"] {
+
+	}
 }
 
 func checkPasswordPolicy(ts string) []Vulnerability {
