@@ -4,6 +4,7 @@ package monitor
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,34 +12,44 @@ import (
 	"time"
 )
 
-// Expected permissions for sensitive files (matches the original Python tool)
 var expectedPerms = map[string]os.FileMode{
-	"/etc/passwd":  0o644,
-	"/etc/shadow":  0o600,
-	"/etc/sudoers": 0o440,
+	"/etc/passwd":          0o644,
+	"/etc/shadow":          0o600,
+	"/etc/gshadow":         0o640,
+	"/etc/group":           0o644,
+	"/etc/sudoers":         0o440,
+	"/etc/ssh/sshd_config": 0o644,
+	"/root":                0o750,
 }
 
-// PasswordMinLength is the minimum PASS_MIN_LEN we consider acceptable
 const PasswordMinLength = 8
 
-// UnnecessaryServices are services we consider suspicious if running
-var UnnecessaryServices = []string{"telnet", "rsh", "rlogin", "rexec", "ypbind"}
+var UnnecessaryServices = []string{"telnet", "telnetd", "rsh", "rlogin", "rexec", "ypbind", "tftp", "vsftpd", "xinetd", "avahi-daemon"}
 
-// scan runs all Linux-specific checks and stores the result.
-func (vs *VulnScanner) scan() {
+func (vs *VulnScanner) scan(ctx context.Context) []Vulnerability {
+	now := time.Now()
+	vs.scanCount++
+
 	var vulns []Vulnerability
-	now := time.Now().Format(time.RFC3339)
-
 	vulns = append(vulns, checkFilePermissions(now)...)
-	vulns = append(vulns, checkSSHRootLogin(now)...)
+	vulns = append(vulns, checkSSHConfig(ctx, now)...)
 	vulns = append(vulns, checkPasswordPolicy(now)...)
-	vulns = append(vulns, checkUnnecessaryServices(now)...)
-	vulns = append(vulns, checkOutdatedPackages(now)...)
+	vulns = append(vulns, checkEmptyPasswords(now)...)
+	vulns = append(vulns, checkUnnecessaryServices(ctx, now)...)
+	vulns = append(vulns, checkFirewall(ctx, now)...)
+	vulns = append(vulns, checkWorldWritable(now)...)
+	vulns = append(vulns, checkPendingReboot(now)...)
 
-	vs.store.SetVulnerabilities(vulns)
+	// The package manager query is slow and hits the disk hard, so it runs on
+	// a longer cadence than the rest of the scan.
+	if vs.packageCheckEvery <= 1 || vs.scanCount%vs.packageCheckEvery == 1 {
+		vs.cachedPackages = checkOutdatedPackages(ctx, now)
+	}
+	vulns = append(vulns, vs.cachedPackages...)
+
+	return vulns
 }
 
-// detectPackageManager returns the first supported package manager found
 func detectPackageManager() string {
 	candidates := map[string]string{
 		"apt":    "/usr/bin/apt",
@@ -55,20 +66,27 @@ func detectPackageManager() string {
 	return ""
 }
 
-func checkFilePermissions(ts string) []Vulnerability {
+func checkFilePermissions(ts time.Time) []Vulnerability {
 	var out []Vulnerability
-	for path, expected := range expectedPerms {
+	for path, max := range maxPerms {
 		info, err := os.Stat(path)
 		if err != nil {
 			continue
 		}
 		actual := info.Mode().Perm()
-		if actual != expected {
+		// Any bit set in actual but not in max is excess permission.
+		if excess := actual &^ max; excess != 0 {
+			sev := SeverityWarning
+			if path == "/etc/shadow" || path == "/etc/sudoers" || path == "/etc/gshadow" {
+				sev = SeverityCritical
+			}
 			out = append(out, Vulnerability{
-				Type:      "weak_permission",
-				Details:   fmt.Sprintf("%s has permissions %o (expected %o)", path, actual, expected),
-				Severity:  "warning",
-				Timestamp: ts,
+				ID:          "perm:" + path,
+				Type:        "weak_permission",
+				Details:     fmt.Sprintf("%s is mode %04o, more permissive than %04o", path, actual, max),
+				Remediation: fmt.Sprintf("chmod %04o %s", max, path),
+				Severity:    sev,
+				Timestamp:   ts,
 			})
 		}
 	}
