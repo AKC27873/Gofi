@@ -9,92 +9,105 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// ========== Summary Tab ==========
+type row struct {
+	plain  string
+	styled string
+}
 
-func (m *Model) viewSummary(width, height int) string {
-	alerts := m.store.Alerts()
-	procs := m.store.Processes()
-	logs := m.store.Logs()
-	vulns := m.store.Vulnerabilities()
-	ports := m.store.OpenPorts()
-	conns := m.store.Connections()
+func plainRow(s string) row { return row{plain: s, styled: s} }
 
-	// Severity breakdown
-	critical, warning, info := 0, 0, 0
-	for _, a := range alerts {
+type tabView struct {
+	title      string
+	pre        string
+	columns    string
+	rows       []row
+	empty      string
+	filterable bool
+}
+
+func (m *Model) viewSummary(width, height int) tabView {
+	snap := m.snap
+
+	var critical, warning, info int
+	for _, a := range snap.Alerts {
 		switch a.Severity {
-		case "critical":
+		case monitor.SeverityCritical:
 			critical++
-		case "warning":
+		case monitor.SeverityWarning:
 			warning++
 		default:
 			info++
 		}
 	}
 
-	// High CPU processes
 	highCPU := 0
-	for _, p := range procs {
+	for _, p := range snap.Processes {
 		if p.CPU > monitor.CPUAlertThreshold {
 			highCPU++
 		}
 	}
 
-	// Vulnerable listening ports
-	vulnPorts := 0
-	for _, p := range ports {
+	vulnPorts, newPorts := 0, 0
+	for _, p := range snap.OpenPorts {
 		if p.Vulnerability != "" {
 			vulnPorts++
 		}
+		if p.New {
+			newPorts++
+		}
 	}
 
-	// Stat tiles laid out in a grid
+	critVulns := 0
+	for _, v := range snap.Vulnerabilities {
+		if v.Severity == monitor.SeverityCritical {
+			critVulns++
+		}
+	}
+
 	tiles := []string{
-		statTile("Alerts", fmt.Sprintf("%d", len(alerts)), pickSeverityForCount(critical, warning)),
-		statTile("Critical", fmt.Sprintf("%d", critical), sevColorFor(critical, "critical")),
-		statTile("Warnings", fmt.Sprintf("%d", warning), sevColorFor(warning, "warning")),
-		statTile("Processes", fmt.Sprintf("%d", len(procs)), "info"),
-		statTile("High CPU", fmt.Sprintf("%d", highCPU), sevColorFor(highCPU, "warning")),
-		statTile("Logs seen", fmt.Sprintf("%d", len(logs)), "info"),
-		statTile("Vulns", fmt.Sprintf("%d", len(vulns)), sevColorFor(len(vulns), "warning")),
-		statTile("Open ports", fmt.Sprintf("%d", len(ports)), "info"),
-		statTile("Risky ports", fmt.Sprintf("%d", vulnPorts), sevColorFor(vulnPorts, "critical")),
-		statTile("Connections", fmt.Sprintf("%d", len(conns)), "info"),
+		statTile("Alerts", fmt.Sprintf("%d", len(snap.Alerts)), worstTone(critical, warning)),
+		statTile("Critical", fmt.Sprintf("%d", critical), toneForCount(critical, "critical")),
+		statTile("Warnings", fmt.Sprintf("%d", warning), toneForCount(warning, "warning")),
+		statTile("Collapsed", fmt.Sprintf("%d", snap.Suppressed), "info"),
+		statTile("Processes", fmt.Sprintf("%d", len(snap.Processes)), "info"),
+		statTile("High CPU", fmt.Sprintf("%d", highCPU), toneForCount(highCPU, "warning")),
+		statTile("Logs seen", fmt.Sprintf("%d", len(snap.Logs)), "info"),
+		statTile("Findings", fmt.Sprintf("%d", len(snap.Vulnerabilities)), toneForCount(critVulns, "critical")),
+		statTile("Open ports", fmt.Sprintf("%d", len(snap.OpenPorts)), "info"),
+		statTile("Risky ports", fmt.Sprintf("%d", vulnPorts), toneForCount(vulnPorts, "critical")),
+		statTile("New ports", fmt.Sprintf("%d", newPorts), toneForCount(newPorts, "warning")),
+		statTile("Outbound", fmt.Sprintf("%d", len(snap.Connections)), "info"),
 	}
 
-	// Arrange tiles in rows of 5
-	tileRows := []string{}
-	for i := 0; i < len(tiles); i += 5 {
-		end := i + 5
+	// Lay the tiles out to fit the terminal instead of assuming five across,
+	// which needed ~100 columns and broke on an 80-column terminal.
+	perRow := width / (statTileWidth + 2)
+	if perRow < 1 {
+		perRow = 1
+	}
+	var tileRows []string
+	for i := 0; i < len(tiles); i += perRow {
+		end := i + perRow
 		if end > len(tiles) {
 			end = len(tiles)
 		}
 		tileRows = append(tileRows, lipgloss.JoinHorizontal(lipgloss.Top, tiles[i:end]...))
 	}
-
 	grid := lipgloss.JoinVertical(lipgloss.Left, tileRows...)
 
-	// Recent alerts section
-	recentHeader := SectionHeaderStyle.Render("Recent alerts")
-	recent := recentAlertLines(alerts, 8, width-2)
-	if len(recent) == 0 {
-		recent = []string{MutedStyle.Render("No alerts yet.")}
+	rows := alertRows(recentAlerts(snap.Alerts, 20), width)
+
+	return tabView{
+		title:      "System overview",
+		pre:        grid + "\n" + SectionHeaderStyle.Render("Recent alerts"),
+		rows:       rows,
+		empty:      MutedStyle.Render("No alerts yet."),
+		filterable: false,
 	}
-
-	recentBlock := lipgloss.JoinVertical(lipgloss.Left,
-		recentHeader,
-		joinLines(recent),
-	)
-
-	return lipgloss.JoinVertical(lipgloss.Left,
-		SectionHeaderStyle.Render("System overview"),
-		grid,
-		"",
-		recentBlock,
-	)
 }
 
-// statTile renders a single summary tile
+const statTileWidth = 16
+
 func statTile(label, value, tone string) string {
 	valStyle := StatValue
 	switch tone {
@@ -105,40 +118,19 @@ func statTile(label, value, tone string) string {
 	case "good":
 		valStyle = StatGoodVal
 	}
-	tile := lipgloss.NewStyle().
+	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(colorBorder).
 		Padding(0, 1).
-		Width(18).
+		Width(statTileWidth).
 		Render(
 			lipgloss.JoinVertical(lipgloss.Left,
 				StatLabel.Render(label),
 				valStyle.Render(value),
-			),
-		)
-	return tile
+			))
 }
 
-func recentAlertLines(alerts []monitor.Alert, n, width int) []string {
-	if len(alerts) == 0 {
-		return nil
-	}
-	start := len(alerts) - n
-	if start < 0 {
-		start = 0
-	}
-	out := []string{}
-	for i := len(alerts) - 1; i >= start; i-- {
-		a := alerts[i]
-		stamp := a.Timestamp.Format("15:04:05")
-		badge := SeverityStyle(a.Severity).Render(fmt.Sprintf("[%s]", strings.ToUpper(a.Severity)))
-		line := fmt.Sprintf("%s %s %s", MutedStyle.Render(stamp), badge, a.Message)
-		out = append(out, truncateLine(line, width))
-	}
-	return out
-}
-
-func pickSeverityForCount(critical, warning int) string {
+func worstTone(critical, warning int) string {
 	if critical > 0 {
 		return "critical"
 	}
@@ -148,19 +140,153 @@ func pickSeverityForCount(critical, warning int) string {
 	return "good"
 }
 
-func sevColorFor(count int, sev string) string {
+func toneForCount(count, int, tone string) string {
 	if count == 0 {
 		return "good"
 	}
-	return sev
+	return tone
 }
 
-// ========== Processes Tab ==========
+func recentAlerts(alerts []monitor.Alert, n int) []monitor.Alert {
+	sorted := make([]monitor.Alert, len(alerts))
+	copy(sorted, alerts)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].LastSeen.After(sorted[j].LastSeen)
+	})
+	if len(sorted) > n {
+		sorted = sorted[:n]
+	}
+	return sorted
+}
+
+func (m *Model) viewProcesses(width, height int) tableView {
+	procs := m.snap.Processes
+
+	sort.Slice(procs, func(i, j int) bool { return procs[i].CPU > procs[j].CPU })
+	const layout = "%-8s %-24s %-14s %8s %8s"
+
+	columns := TableHeaderStyle.Render(fmt.Sprintf(layout, "PID", "NAME", "USER", "CPU%", "MEM%"))
+
+	rows := make([]row, 0, len(procs))
+	for _, p := range procs {
+		plain := fmt.Sprintf("%-8d %-24s %-14s %7.1f%% %7.1f%%",
+			p.PID, clip(p.Name, 24), clip(p.Username, 14), p.CPU, p.Memory)
+		styled := plain
+		switch {
+		case p.CPU > monitor.CPUAlertThreshold:
+			styled = SeverityCriticalStyle.Render(plain)
+		case p.CPU > monitor.CPUAlertThreshold/2:
+			styled = SeverityWarningStyle.Render(plain)
+		}
+		rows = append(rows, row{plain: plain, styled: styled})
+	}
+	return tabView{
+		title:      fmt.Sprintf("Processes (%d)", len(procs)),
+		columns:    columns,
+		rows:       rows,
+		empty:      MutedStyle.Render("No processes collected yet."),
+		filterable: true,
+	}
+}
+
+func (m *Model) viewLogs(width, height int) tabView {
+	logs := m.snap.Logs
+
+	rows := make([]row, 0, len(logs))
+	for i := len(logs) - 1; i >= 0; i-- {
+		l := logs[i]
+		stamp := l.Timestamp.Format("15:04:05")
+		prefixPlain := fmt.Sprintf("%s [%s] ", stamp, l.Source)
+		msgWidth := width - len(prefixPlain)
+
+		styled := MutedStyle.Render(stamp) + " " +
+
+			SeverityInfoStyle.Render("["+l.Source+"]") + " " +
+
+			truncatePlain(l.Message, msgWidth)
+
+		rows = append(rows, row{plain: prefixPlain + l.Message, styled: styled})
+	}
+	return tabView{
+		title:      fmt.Sprintf("Logs (%d)", len(logs)),
+		rows:       rows,
+		empty:      MutedStyle.Render("No log entries yet. gofi tails common log files and falls back to journalctl (both need read access)."),
+		filterable: true,
+	}
+}
+
+func viewAlerts(width, height int) tabView {
+	alerts := recentAlerts(m.snap.Alerts, len(m.snap.Alerts))
+	suffix := ""
+	if m.snap.Suppressed > 0 {
+		suffix = fmt.Sprintf("- %d repeats collapsed", m.snap.Suppressed)
+	}
+	return tabView{
+		title:      fmt.Sprintf("Alerts (%d)%s", len(alerts), suffix),
+		rows:       alertRows(alerts, width),
+		empty:      MutedStyle.Render("No alerts yet."),
+		filterable: true,
+	}
+}
+
+func alertRows(alerts []monitor.Alert, width int) []row {
+	rows := make([]row, 0, len(alerts))
+	for _, a := range alerts {
+		stamp := a.LastSeen.Format("15:04:05")
+		sevText := fmt.Sprintf("%-8s", strings.ToUpper(string(a.Severity)))
+		catText := fmt.Sprintf("%-9s", a.Category)
+
+		count := ""
+		if a.Count > 1 {
+			count = fmt.Sprintf("x%d", a.Count)
+		}
+		prefixPlain := fmt.Sprintf("%s %s %s ", stamp, sevText, catText)
+		msgWidth := width - len(prefixPlain) - len(count)
+
+		styled := MutedStyle.Render(stamp) + " " +
+			SeverityStyle(a.Severity).Render(sevText) + " " +
+			MutedStyle.Render(a.Message, msgWidth)
+		if count != "" {
+			styled += CountStyle.Render(count)
+		}
+		rows = append(rows, row{plain: prefixPlain + a.Message + count, styled: styled})
+	}
+	return rows
+}
+
+func (m *Model) viewVulnerabilities(width, height int) tabView {
+	vulns := m.snap.Vulnerabilities
+
+	grouped := map[string][]monitor.Vulnerability{}
+	for _, v := range vulns {
+		grouped[v.Type] = append(grouped[v.Type], v)
+	}
+	types := make([]string, 0, len(grouped))
+	for t := range grouped {
+		types = append(types, t)
+	}
+	sort.Strings(types)
+
+	rows := []row{}
+	for _, t := range types {
+		items := grouped[t]
+		sort.SliceStables(items, func(i, j int) bool {
+			return items[i].Severity.Rank() > items[j].Severity.Rank()
+		})
+		heads := fmt.Sprintf("%s (%d)", t, len(items))
+		rows = append(rows, row{
+			plain:  head,
+			styled: lipgloss.NewStyle().Bold(true).Foreground(colorInfo).Render(head),
+		})
+		for _, v := range items {
+			return
+		}
+	}
+}
 
 func (m *Model) viewProcesses(width, height int) string {
 	procs := m.store.Processes()
 
-	// Sort by CPU desc for most useful default ordering
 	sort.Slice(procs, func(i, j int) bool { return procs[i].CPU > procs[j].CPU })
 
 	header := SectionHeaderStyle.Render(fmt.Sprintf("Processes (%d)", len(procs)))
@@ -178,7 +304,6 @@ func (m *Model) viewProcesses(width, height int) string {
 		table = append(table, row)
 	}
 
-	// Scrolling body — header stays, rows scroll
 	rows := table[1:]
 	windowed := m.scrollAndClamp(rows, height-3)
 
@@ -212,43 +337,15 @@ func (m *Model) viewLogs(width, height int) string {
 	return lipgloss.JoinVertical(lipgloss.Left, header, joinLines(windowed))
 }
 
-// ========== Alerts Tab ==========
-
-func (m *Model) viewAlerts(width, height int) string {
-	alerts := m.store.Alerts()
-	header := SectionHeaderStyle.Render(fmt.Sprintf("Alerts (%d)", len(alerts)))
-
-	lines := make([]string, 0, len(alerts))
-	// Newest first
-	for i := len(alerts) - 1; i >= 0; i-- {
-		a := alerts[i]
-		stamp := a.Timestamp.Format("15:04:05")
-		sev := SeverityStyle(a.Severity).Render(fmt.Sprintf("%-8s", strings.ToUpper(a.Severity)))
-		cat := MutedStyle.Render(fmt.Sprintf("%-10s", a.Category))
-		line := fmt.Sprintf("%s %s %s %s",
-			MutedStyle.Render(stamp), sev, cat, a.Message)
-		lines = append(lines, truncateLine(line, width))
-	}
-	windowed := m.scrollAndClamp(lines, height-2)
-	if len(windowed) == 0 {
-		windowed = []string{MutedStyle.Render("No alerts yet.")}
-	}
-	return lipgloss.JoinVertical(lipgloss.Left, header, joinLines(windowed))
-}
-
-// ========== Vulnerabilities Tab ==========
-
 func (m *Model) viewVulnerabilities(width, height int) string {
 	vulns := m.store.Vulnerabilities()
 	header := SectionHeaderStyle.Render(fmt.Sprintf("Vulnerabilities (%d)", len(vulns)))
 
-	// Group by type for scan-ability
 	grouped := map[string][]monitor.Vulnerability{}
 	for _, v := range vulns {
 		grouped[v.Type] = append(grouped[v.Type], v)
 	}
 
-	// Stable ordering
 	types := make([]string, 0, len(grouped))
 	for t := range grouped {
 		types = append(types, t)
@@ -274,13 +371,10 @@ func (m *Model) viewVulnerabilities(width, height int) string {
 	return lipgloss.JoinVertical(lipgloss.Left, header, joinLines(windowed))
 }
 
-// ========== Ports Tab ==========
-
 func (m *Model) viewPorts(width, height int) string {
 	ports := m.store.OpenPorts()
 	header := SectionHeaderStyle.Render(fmt.Sprintf("Listening ports (%d)", len(ports)))
 
-	// Sort: risky first, then by port number
 	sort.Slice(ports, func(i, j int) bool {
 		if (ports[i].Vulnerability != "") != (ports[j].Vulnerability != "") {
 			return ports[i].Vulnerability != ""
@@ -307,8 +401,6 @@ func (m *Model) viewPorts(width, height int) string {
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, header, headerRow, joinLines(windowed))
 }
-
-// ========== Connections Tab ==========
 
 func (m *Model) viewConnections(width, height int) string {
 	conns := m.store.Connections()
@@ -347,15 +439,10 @@ func (m *Model) viewConnections(width, height int) string {
 	return lipgloss.JoinVertical(lipgloss.Left, header, headerRow, joinLines(windowed))
 }
 
-// truncateLine cuts a string to at most n visible characters.
-// It's a simple byte-length truncation — good enough for ASCII-heavy
-// monitoring output and avoids pulling in a full width-aware library.
 func truncateLine(s string, n int) string {
 	if n <= 0 {
 		return ""
 	}
-	// Account for ANSI codes: we approximate by only truncating the plain
-	// string if it has no escape codes. For styled output we leave it alone.
 	if strings.Contains(s, "\x1b") {
 		return s
 	}
