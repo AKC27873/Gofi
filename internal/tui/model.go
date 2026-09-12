@@ -13,7 +13,6 @@ import (
 	"github.com/AKC27873/gofi/internal/monitor"
 )
 
-// Tab represents a tab in the TUI
 type Tab int
 
 const (
@@ -26,7 +25,6 @@ const (
 	TabConnections
 )
 
-// tabNames is the ordered list of tab labels
 var tabNames = []string{
 	"Summary",
 	"Processes",
@@ -37,28 +35,72 @@ var tabNames = []string{
 	"Connections",
 }
 
-// tickMsg fires on a regular interval to refresh the view
 type tickMsg time.Time
 
-// Model is the top-level Bubble Tea model
+type clearStatusMsg struct{}
+
+type Options struct {
+	store           *monitor.Store
+	Baseline        *monitor.Baseline
+	Cancel          context.CancelFunc
+	Version         string
+	ExportDir       string
+	RefreshInterval time.Duration
+}
+
 type Model struct {
-	store  *monitor.Store
-	cancel context.CancelFunc
+	store    *monitor.Store
+	baseline *monitor.Baseline
+	cancel   context.CancelFunc
+	version  string
+
+	exportDir string
+	refresh   time.Duration
+
+	snap   monitor.Snapshot
+	paused bool
 
 	activeTab Tab
 	width     int
 	height    int
 
-	// Per-tab vertical scroll offsets
 	scroll map[Tab]int
+	filter map[Tab]string
+
+	filtering bool
+	filterBuf string
+
+	showHelp    bool
+	status      string
+	statusIsErr bool
 }
 
-// NewModel constructs the TUI model and kicks off background monitors
+func New(opts Options) *Model {
+	if opts.RefreshInterval <= 0 {
+		opts.RefreshInterval = time.Second
+	}
+	if opts.ExportDir == "" {
+		opts.ExportDir = "."
+	}
+	m := &Model{
+		store:     opts.Store,
+		baseline:  opts.Baseline,
+		cancel:    opts.Cancel,
+		version:   opts.Version,
+		exportDir: opts.ExportDir,
+		refresh:   opts.RefreshInterval,
+		activeTab: TabSummary,
+		scroll:    make(map[Tab]int),
+		filter:    make(map[Tab]string),
+	}
+	m.snap = opts.Store.Snapshot()
+	return m
+}
+
 func NewModel() *Model {
 	store := monitor.NewStore()
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Launch all the monitors. Each one is self-contained and writes to the store.
 	rules := config.LoadRules("log_rules.yaml")
 	logFiles := monitor.DiscoverLogFiles()
 
@@ -80,7 +122,6 @@ func NewModel() *Model {
 	}
 }
 
-// Init satisfies tea.Model and schedules the first tick
 func (m *Model) Init() tea.Cmd {
 	return tickCmd()
 }
@@ -91,7 +132,6 @@ func tickCmd() tea.Cmd {
 	})
 }
 
-// Update handles input and refresh events
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -144,7 +184,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// View renders the full UI
 func (m *Model) View() string {
 	if m.width == 0 || m.height == 0 {
 		return "Loading..."
@@ -154,8 +193,6 @@ func (m *Model) View() string {
 	tabs := m.renderTabs()
 	footer := m.renderFooter()
 
-	// Calculate the height available for the main content panel.
-	// We subtract: header(1) + tabs(1) + footer(1) + blank separator lines
 	chromeHeight := lipgloss.Height(header) + lipgloss.Height(tabs) + lipgloss.Height(footer) + 2
 	bodyHeight := m.height - chromeHeight
 	if bodyHeight < 5 {
@@ -196,9 +233,7 @@ func (m *Model) renderFooter() string {
 	return HelpStyle.Render(help)
 }
 
-// renderBody dispatches to the per-tab renderer
 func (m *Model) renderBody(height int) string {
-	// Leave room for the panel's border/padding (2 lines vertical, 2 cols horizontal)
 	innerWidth := m.width - 4
 	innerHeight := height - 2
 	if innerWidth < 20 {
@@ -229,7 +264,6 @@ func (m *Model) renderBody(height int) string {
 	return PanelStyle.Width(m.width - 2).Height(height).Render(content)
 }
 
-// scrollAndClamp clamps the current scroll offset and returns a window of lines
 func (m *Model) scrollAndClamp(lines []string, height int) []string {
 	if len(lines) <= height {
 		m.scroll[m.activeTab] = 0
@@ -246,7 +280,6 @@ func (m *Model) scrollAndClamp(lines []string, height int) []string {
 	return lines[start : start+height]
 }
 
-// joinLines joins a slice of lines with newlines, safe for empty slices
 func joinLines(lines []string) string {
 	return strings.Join(lines, "\n")
 }
