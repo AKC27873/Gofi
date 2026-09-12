@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -50,22 +49,6 @@ func (vs *VulnScanner) scan(ctx context.Context) []Vulnerability {
 	vulns = append(vulns, vs.cachedPackages...)
 
 	return vulns
-}
-
-func detectPackageManager() string {
-	candidates := map[string]string{
-		"apt":    "/usr/bin/apt",
-		"dnf":    "/usr/bin/dnf",
-		"yum":    "/usr/bin/yum",
-		"pacman": "/usr/bin/pacman",
-		"zypper": "/usr/bin/zypper",
-	}
-	for name, path := range candidates {
-		if _, err := os.Stat(path); err == nil {
-			return name
-		}
-	}
-	return ""
 }
 
 func checkFilePermissions(ts time.Time) []Vulnerability {
@@ -268,7 +251,7 @@ func checkEmptyPasswords(ts time.Time) []Vulnerability {
 		if fields[1] == "" {
 			out = append(out, Vulnerability{
 				ID:          "account:emptypw" + fields[0],
-				Type:        "empty_passwor",
+				Type:        "empty_password",
 				Details:     fmt.Sprintf("Account %q has no password set", fields[0]),
 				Remediation: fmt.Sprintf("passwd -l %s", fields[0]),
 				Severity:    SeverityCritical,
@@ -280,70 +263,201 @@ func checkEmptyPasswords(ts time.Time) []Vulnerability {
 }
 
 func checkUnnecessaryServices(ts string) []Vulnerability {
-	var out []Vulnerability
-	if _, err := exec.LookPath("systemctl"); err != nil {
+	if !commandExists("systemctl") {
 		return nil
 	}
+	var out []Vulnerability
 
 	for _, svc := range UnnecessaryServices {
-		cmd := exec.Command("systemctl", "is-active", svc)
-		output, _ := cmd.Output()
-		status := strings.TrimSpace(string(output))
-		if status == "active" {
+		select {
+		case <-ctx.Done():
+			return out
+		default:
+		}
+
+		output, _ := runCommand(ctx, "systemctl", "is-active", svc)
+		if strings.TrimSpace(output) == "active" {
 			out = append(out, Vulnerability{
-				Type:      "unnecessary_service",
-				Details:   fmt.Sprintf("Service %s is running", svc),
-				Severity:  "warning",
-				Timestamp: ts,
+				ID:          "service:" + svc,
+				Type:        "unnecessary_service",
+				Details:     fmt.Sprintf("Legacy service %s is running", svc),
+				Remediation: fmt.Sprintf("systemctl disable -- now %s", svc),
+				Severity:    SeverityWarning,
+				Timestamp:   ts,
 			})
 		}
 	}
 	return out
 }
 
-func checkOutdatedPackages(ts string) []Vulnerability {
+func checkFirewall(ctx context.Context, ts time.Time) []Vulnerability {
+	type probe struct {
+		bin   string
+		args  []string
+		match func(string) bool
+	}
+	probes := []probe{
+		{"ufw", []string{"status"}, func(s string) bool {
+			return strings.Contains(strings.ToLower(s), "status: active")
+		}},
+
+		{"firewall-cmd", []string{"--state"}, func(s string) bool {
+			return strings.Contains(strings.ToLower(s), "running")
+		}},
+
+		{"nft", []string{"list", "ruleset"}, func(s string) bool {
+			return strings.Contains(s, "chain")
+		}},
+
+		{"iptables", []string{"-S"}, func(s string) bool {
+			return strings.Contains(s, "-A")
+		}},
+	}
+	found := false
+	available := false
+	for _, p := range probes {
+		if !commandExists(p.bin) {
+			continue
+		}
+		available = true
+		out, err := runCommand(ctx, p.bin, p.args...)
+		if err != nil && out == "" {
+			continue
+		}
+		if p.match(out) {
+			found = true
+			break
+		}
+	}
+	if !available || found {
+		return nil
+	}
+	return []Vulnerability{{
+		ID:          "firewall:inactive",
+		Type:        "no_firewall",
+		Details:     "No active host firewall detected (ufw/firewall/nftables/iptables) all empty or inactive",
+		Remediation: "Enable a firewall service",
+		Severity:    SeverityWarning,
+		Timestamp:   ts,
+	}}
+}
+
+func checkWorldWritable(ts time.Time) []Vulnerability {
+	dirs := []string{"/usr/local/bin", "/usr/local/sbin", "/usr/bin", "/usr/sbin", "/bin", "/sbin"}
+	var out []Vulnerability
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			info, err := e.Info()
+			if err != nil || info.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			if info.Mode().Perm()&0o002 != 0 {
+				path := filepath.Join(dir, e.Name())
+				out = append(out, Vulnerability{
+					ID:          "wwrite:" + path,
+					Type:        "world_writable",
+					Details:     fmt.Sprintf("%s is world-writable (%04o)", path, info.Mode().Perm()),
+					Remediation: fmt.Sprintf("chmod o-w %s", path),
+					Severity:    SeverityCritical,
+					Timestamp:   ts,
+				})
+				if len(out) >= 25 {
+					return out
+				}
+			}
+		}
+	}
+	return out
+}
+
+func checkPendingReboot(ts time.Time) []Vulnerability {
+	if _, err := os.Stat("/var/run/reboot-required"); err == nil {
+		return []Vulnerability{{
+			ID:        "system:reboot_required",
+			Type:      "pending_reboot",
+			Details:   "A reboot is required to finish applying updates",
+			Severity:  SeverityWarning,
+			Timestamp: ts,
+		}}
+	}
+	return nil
+}
+
+func detectPackageManager() string {
+	for _, name := range []string{"apt-get", "dnf", "yum", "pacman", "zypper", "apk"} {
+		if commandExists(name) {
+			return name
+		}
+	}
+	return ""
+}
+
+func checkOutdatedPackages(ctx context.Context, ts time.Time) []Vulnerability {
 	pm := detectPackageManager()
+
 	if pm == "" {
 		return nil
 	}
-	var cmd *exec.Cmd
+	var name string
+	var args []string
+
 	switch pm {
-	case "apt":
-		cmd = exec.Command("apt", "list", "--upgradable")
+	case "apt-get":
+		name, args = "apt-get", []string{"--just-print", "upgrade"}
 	case "dnf":
-		cmd = exec.Command("dnf", "list", "updates")
+		name, args = "dnf", []string{"--cacheonly", "list", "updates"}
 	case "yum":
-		cmd = exec.Command("yum", "list", "updates")
+		name, args = "yum", []string{"--cacheonly", "list", "updates"}
 	case "pacman":
-		cmd = exec.Command("pacman", "-Qu")
+		name, args = "pacman", []string{"-Qu"}
 	case "zypper":
-		cmd = exec.Command("zypper", "list-updates")
+		name, args = "zypper", []string{"--non-interactive", "list-updates"}
+	case "apk":
+		name, args = "apk", []string{"version", "-l", "<"}
 	default:
 		return nil
 	}
-
-	output, err := cmd.Output()
-	if err != nil {
+	output, err := runCommand(ctx, name, args...)
+	if err != nil && output == "" {
 		return nil
 	}
-	lines := strings.Split(string(output), "\n")
 	var out []Vulnerability
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "Listing") || strings.HasPrefix(line, "Last metadata") {
+	for _, line := range nonEmptyLines(output) {
+		if pm == "apt-get" {
+			if !strings.HasPrefix(line, "Inst") {
+				continue
+			}
+			line = strings.TrimPrefix(line, "Inst")
+		} else if strings.HasPrefix(line, "Listing") ||
+			strings.HasPrefix(line, "Last metadata") ||
+			strings.HasPrefix(line, "Available") ||
+			strings.HasPrefix(line, "Loading") ||
+			strings.HasPrefix(line, "Repository") {
 			continue
 		}
-		// Skip the package manager's header-ish lines
-		if strings.HasPrefix(line, "Available") || strings.HasPrefix(line, "Updated") {
-			continue
+		sev := SeverityInfo
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "security") {
+			sev = SeverityWarning
 		}
-		out = append(out, Vulnerability{
-			Type:      "outdated_package",
-			Details:   line,
-			Severity:  "info",
-			Timestamp: ts,
+		pkg := strings.Fields(line)
+		id := line
+
+		if len(pkg) > 0 {
+			id = pkg[0]
+		}
+		ou = append(out, Vulnerability{
+			ID:          "pkg:" + id,
+			Type:        "outdated_package",
+			Details:     line,
+			Remediation: "Apply pending package updates",
+			Severity:    sev,
+			Timestamp:   ts,
 		})
-		// Cap at 50 to avoid flooding
 		if len(out) >= 50 {
 			break
 		}
