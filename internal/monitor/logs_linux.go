@@ -5,32 +5,47 @@ package monitor
 import (
 	"context"
 	"os"
+	"os/exec"
 )
 
-// CommonLogFiles are the log paths we attempt to monitor on Linux.
 var CommonLogFiles = []string{
 	"/var/log/syslog",
 	"/var/log/auth.log",
 	"/var/log/kern.log",
 	"/var/log/secure",
 	"/var/log/messages",
+	"/var/log/audit/audit.log",
+	"/var/log/nginx/error.log",
+	"/var/log/apache2/error.log",
 }
 
-// DiscoverLogFiles returns log files that exist and can be opened on this host.
 func DiscoverLogFiles() []string {
 	out := []string{}
 	for _, f := range CommonLogFiles {
-		if _, err := os.Stat(f); err == nil {
-			out = append(out, f)
+		fh, err := os.Open(f)
+		if err != nil {
+			continue
 		}
+		fh.Close()
+		out = append(out, f)
 	}
 	return out
 }
 
-// Run starts tailing each file in its own goroutine and blocks until ctx is done.
+func journalCommand(ctx context.Context) *exec.Cmd {
+	path, err := exec.LookPath("journalctl")
+	if err != nil {
+		return nil
+	}
+	return exec.CommandContext(ctx, path, "-f", "-n", "0", "-o", "short-iso", "--no-pager")
+}
+
 func (lm *LogMonitor) Run(ctx context.Context) {
 	for _, f := range lm.files {
 		go lm.tail(ctx, f)
+	}
+	if len(lm.files) == 0 && lm.journal {
+		go lm.tail(ctx)
 	}
 	<-ctx.Done()
 }
