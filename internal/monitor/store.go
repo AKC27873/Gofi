@@ -26,8 +26,8 @@ type Store struct {
 
 	// Tracking for brute force detection
 	failedLogins map[string][]time.Time
-	maxAlerts    int
-	maxLogs      int
+	MaxAlerts    int
+	MaxLogs      int
 	dedupWindow  time.Duration
 	bruteWindow  time.Duration
 }
