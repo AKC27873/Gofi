@@ -1,9 +1,11 @@
 package tui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"github.com/AKC27873/gofi/internal/monitor"
+	"github.com/charmbracelet/lipgloss"
+)
 
 var (
-	// Color palette
 	colorPrimary   = lipgloss.Color("#7D56F4")
 	colorSecondary = lipgloss.Color("#43BF6D")
 	colorWarning   = lipgloss.Color("#FFA500")
@@ -12,68 +14,70 @@ var (
 	colorMuted     = lipgloss.Color("#6C6C6C")
 	colorText      = lipgloss.Color("#E8E8E8")
 	colorBorder    = lipgloss.Color("#3C3C3C")
+	colorAccent    = lipgloss.Color("#F2C94C")
 
-	// Title style at the top of the app
 	TitleStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("#FFFFFF")).
 			Background(colorPrimary).
 			Padding(0, 2)
 
-	// Active tab
 	ActiveTabStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("#FFFFFF")).
 			Background(colorPrimary).
 			Padding(0, 2)
 
-	// Inactive tab
 	InactiveTabStyle = lipgloss.NewStyle().
 				Foreground(colorMuted).
 				Padding(0, 2)
 
-	// Bordered panel for content
 	PanelStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(colorBorder).
 			Padding(0, 1)
 
-	// Section heading inside a panel
 	SectionHeaderStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(colorSecondary).
-				MarginBottom(1)
+				Foreground(colorSecondary)
 
-	// Table header row
 	TableHeaderStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(colorInfo).
-				BorderStyle(lipgloss.NormalBorder()).
-				BorderBottom(true).
-				BorderForeground(colorBorder)
+				Foreground(colorInfo)
 
-	// Severity colors for alerts
 	SeverityCriticalStyle = lipgloss.NewStyle().Foreground(colorCritical).Bold(true)
 	SeverityWarningStyle  = lipgloss.NewStyle().Foreground(colorWarning)
 	SeverityInfoStyle     = lipgloss.NewStyle().Foreground(colorInfo)
 
-	// Helpers
 	MutedStyle  = lipgloss.NewStyle().Foreground(colorMuted)
 	StatLabel   = lipgloss.NewStyle().Foreground(colorMuted)
 	StatValue   = lipgloss.NewStyle().Bold(true).Foreground(colorText)
 	StatGoodVal = lipgloss.NewStyle().Bold(true).Foreground(colorSecondary)
+	StatWarnVal = lipgloss.NewStyle().Bold(true).Foreground(colorWarning)
 	StatBadVal  = lipgloss.NewStyle().Bold(true).Foreground(colorCritical)
 
-	// Footer help text
+	NewBadgeStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#000000")).Background(colorAccent)
+
+	CountStyle = lipgloss.NewStyle().Foreground(colorAccent)
+
+	FilterStyle = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
+	StatusStyle = lipgloss.NewStyle().Foreground(colorSecondary)
+	ErrorStyle  = lipgloss.NewStyle().Foreground(colorCritical)
+	PausedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#000000")).Background(colorAccent)
+
 	HelpStyle = lipgloss.NewStyle().Foreground(colorMuted).Italic(true)
+
+	HelpPanelStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colorAccent).
+			Padding(1, 2)
 )
 
-// SeverityStyle returns a style appropriate for the given severity
-func SeverityStyle(severity string) lipgloss.Style {
-	switch severity {
-	case "critical":
+func SeverityStyle(s monitor.Severity) lipgloss.Style {
+	switch s {
+	case monitor.SeverityCritical:
 		return SeverityCriticalStyle
-	case "warning":
+	case monitor.SeverityWarning:
 		return SeverityWarningStyle
 	default:
 		return SeverityInfoStyle

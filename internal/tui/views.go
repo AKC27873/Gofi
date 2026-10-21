@@ -2,8 +2,10 @@ package tui
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/AKC27873/gofi/internal/monitor"
 	"github.com/charmbracelet/lipgloss"
@@ -24,6 +26,8 @@ type tabView struct {
 	empty      string
 	filterable bool
 }
+
+// ========== Summary ==========
 
 func (m *Model) viewSummary(width, height int) tabView {
 	snap := m.snap
@@ -79,8 +83,6 @@ func (m *Model) viewSummary(width, height int) tabView {
 		statTile("Outbound", fmt.Sprintf("%d", len(snap.Connections)), "info"),
 	}
 
-	// Lay the tiles out to fit the terminal instead of assuming five across,
-	// which needed ~100 columns and broke on an 80-column terminal.
 	perRow := width / (statTileWidth + 2)
 	if perRow < 1 {
 		perRow = 1
@@ -114,7 +116,7 @@ func statTile(label, value, tone string) string {
 	case "critical":
 		valStyle = StatBadVal
 	case "warning":
-		valStyle = lipgloss.NewStyle().Bold(true).Foreground(colorWarning)
+		valStyle = StatWarnVal
 	case "good":
 		valStyle = StatGoodVal
 	}
@@ -123,11 +125,10 @@ func statTile(label, value, tone string) string {
 		BorderForeground(colorBorder).
 		Padding(0, 1).
 		Width(statTileWidth).
-		Render(
-			lipgloss.JoinVertical(lipgloss.Left,
-				StatLabel.Render(label),
-				valStyle.Render(value),
-			))
+		Render(lipgloss.JoinVertical(lipgloss.Left,
+			StatLabel.Render(label),
+			valStyle.Render(value),
+		))
 }
 
 func worstTone(critical, warning int) string {
@@ -140,7 +141,7 @@ func worstTone(critical, warning int) string {
 	return "good"
 }
 
-func toneForCount(count, int, tone string) string {
+func toneForCount(count int, tone string) string {
 	if count == 0 {
 		return "good"
 	}
@@ -159,12 +160,11 @@ func recentAlerts(alerts []monitor.Alert, n int) []monitor.Alert {
 	return sorted
 }
 
-func (m *Model) viewProcesses(width, height int) tableView {
+func (m *Model) viewProcesses(width, height int) tabView {
 	procs := m.snap.Processes
-
 	sort.Slice(procs, func(i, j int) bool { return procs[i].CPU > procs[j].CPU })
-	const layout = "%-8s %-24s %-14s %8s %8s"
 
+	const layout = "%-8s %-24s %-14s %8s %8s"
 	columns := TableHeaderStyle.Render(fmt.Sprintf(layout, "PID", "NAME", "USER", "CPU%", "MEM%"))
 
 	rows := make([]row, 0, len(procs))
@@ -180,6 +180,7 @@ func (m *Model) viewProcesses(width, height int) tableView {
 		}
 		rows = append(rows, row{plain: plain, styled: styled})
 	}
+
 	return tabView{
 		title:      fmt.Sprintf("Processes (%d)", len(procs)),
 		columns:    columns,
@@ -193,20 +194,19 @@ func (m *Model) viewLogs(width, height int) tabView {
 	logs := m.snap.Logs
 
 	rows := make([]row, 0, len(logs))
-	for i := len(logs) - 1; i >= 0; i-- {
+	for i := len(logs) - 1; i >= 0; i-- { // newest first
 		l := logs[i]
 		stamp := l.Timestamp.Format("15:04:05")
 		prefixPlain := fmt.Sprintf("%s [%s] ", stamp, l.Source)
 		msgWidth := width - len(prefixPlain)
 
 		styled := MutedStyle.Render(stamp) + " " +
-
 			SeverityInfoStyle.Render("["+l.Source+"]") + " " +
-
 			truncatePlain(l.Message, msgWidth)
 
 		rows = append(rows, row{plain: prefixPlain + l.Message, styled: styled})
 	}
+
 	return tabView{
 		title:      fmt.Sprintf("Logs (%d)", len(logs)),
 		rows:       rows,
@@ -215,11 +215,11 @@ func (m *Model) viewLogs(width, height int) tabView {
 	}
 }
 
-func viewAlerts(width, height int) tabView {
+func (m *Model) viewAlerts(width, height int) tabView {
 	alerts := recentAlerts(m.snap.Alerts, len(m.snap.Alerts))
 	suffix := ""
 	if m.snap.Suppressed > 0 {
-		suffix = fmt.Sprintf("- %d repeats collapsed", m.snap.Suppressed)
+		suffix = fmt.Sprintf(" — %d repeats collapsed", m.snap.Suppressed)
 	}
 	return tabView{
 		title:      fmt.Sprintf("Alerts (%d)%s", len(alerts), suffix),
@@ -238,17 +238,20 @@ func alertRows(alerts []monitor.Alert, width int) []row {
 
 		count := ""
 		if a.Count > 1 {
-			count = fmt.Sprintf("x%d", a.Count)
+			count = fmt.Sprintf(" x%d", a.Count)
 		}
+
 		prefixPlain := fmt.Sprintf("%s %s %s ", stamp, sevText, catText)
 		msgWidth := width - len(prefixPlain) - len(count)
 
 		styled := MutedStyle.Render(stamp) + " " +
 			SeverityStyle(a.Severity).Render(sevText) + " " +
-			MutedStyle.Render(a.Message, msgWidth)
+			MutedStyle.Render(catText) + " " +
+			truncatePlain(a.Message, msgWidth)
 		if count != "" {
 			styled += CountStyle.Render(count)
 		}
+
 		rows = append(rows, row{plain: prefixPlain + a.Message + count, styled: styled})
 	}
 	return rows
@@ -270,187 +273,286 @@ func (m *Model) viewVulnerabilities(width, height int) tabView {
 	rows := []row{}
 	for _, t := range types {
 		items := grouped[t]
-		sort.SliceStables(items, func(i, j int) bool {
+
+		sort.SliceStable(items, func(i, j int) bool {
 			return items[i].Severity.Rank() > items[j].Severity.Rank()
 		})
-		heads := fmt.Sprintf("%s (%d)", t, len(items))
+
+		head := fmt.Sprintf("%s (%d)", t, len(items))
 		rows = append(rows, row{
 			plain:  head,
 			styled: lipgloss.NewStyle().Bold(true).Foreground(colorInfo).Render(head),
 		})
+
 		for _, v := range items {
-			return
+			sevText := fmt.Sprintf("[%s]", strings.ToUpper(string(v.Severity)))
+			plain := fmt.Sprintf("  %s %s", sevText, v.Details)
+			styled := "  " + SeverityStyle(v.Severity).Render(sevText) + " " +
+				truncatePlain(v.Details, width-len(sevText)-3)
+			rows = append(rows, row{plain: plain, styled: styled})
+
+			if v.Remediation != "" {
+				fix := "      fix: " + v.Remediation
+				rows = append(rows, row{
+					plain:  fix,
+					styled: MutedStyle.Render(truncatePlain(fix, width)),
+				})
+			}
 		}
+		rows = append(rows, plainRow(""))
+	}
+
+	return tabView{
+		title:      fmt.Sprintf("Findings (%d)", len(vulns)),
+		rows:       rows,
+		empty:      MutedStyle.Render("No findings yet. The first scan runs at startup."),
+		filterable: true,
 	}
 }
 
-func (m *Model) viewProcesses(width, height int) string {
-	procs := m.store.Processes()
+func (m *Model) viewPorts(width, height int) tabView {
+	ports := m.snap.OpenPorts
 
-	sort.Slice(procs, func(i, j int) bool { return procs[i].CPU > procs[j].CPU })
-
-	header := SectionHeaderStyle.Render(fmt.Sprintf("Processes (%d)", len(procs)))
-
-	table := []string{
-		TableHeaderStyle.Render(fmt.Sprintf("%-8s %-20s %-12s %7s %7s",
-			"PID", "NAME", "USER", "CPU%", "MEM%")),
-	}
-	for _, p := range procs {
-		row := fmt.Sprintf("%-8d %-20s %-12s %6.1f%% %6.1f%%",
-			p.PID, truncateLine(p.Name, 20), truncateLine(p.Username, 12), p.CPU, p.Memory)
-		if p.CPU > monitor.CPUAlertThreshold {
-			row = SeverityCriticalStyle.Render(row)
-		}
-		table = append(table, row)
-	}
-
-	rows := table[1:]
-	windowed := m.scrollAndClamp(rows, height-3)
-
-	return lipgloss.JoinVertical(lipgloss.Left,
-		header,
-		table[0],
-		joinLines(windowed),
-	)
-}
-
-// ========== Logs Tab ==========
-
-func (m *Model) viewLogs(width, height int) string {
-	logs := m.store.Logs()
-	header := SectionHeaderStyle.Render(fmt.Sprintf("Logs (%d)", len(logs)))
-
-	lines := make([]string, 0, len(logs))
-	for _, l := range logs {
-		stamp := l.Timestamp.Format("15:04:05")
-		prefix := fmt.Sprintf("%s %s ",
-			MutedStyle.Render(stamp),
-			lipgloss.NewStyle().Foreground(colorInfo).Render(fmt.Sprintf("[%s]", l.Source)),
-		)
-		line := prefix + l.Message
-		lines = append(lines, truncateLine(line, width))
-	}
-	windowed := m.scrollAndClamp(lines, height-2)
-	if len(windowed) == 0 {
-		windowed = []string{MutedStyle.Render("No log entries yet. gofi tails common log files (requires read access).")}
-	}
-	return lipgloss.JoinVertical(lipgloss.Left, header, joinLines(windowed))
-}
-
-func (m *Model) viewVulnerabilities(width, height int) string {
-	vulns := m.store.Vulnerabilities()
-	header := SectionHeaderStyle.Render(fmt.Sprintf("Vulnerabilities (%d)", len(vulns)))
-
-	grouped := map[string][]monitor.Vulnerability{}
-	for _, v := range vulns {
-		grouped[v.Type] = append(grouped[v.Type], v)
-	}
-
-	types := make([]string, 0, len(grouped))
-	for t := range grouped {
-		types = append(types, t)
-	}
-	sort.Strings(types)
-
-	lines := []string{}
-	for _, t := range types {
-		items := grouped[t]
-		lines = append(lines, lipgloss.NewStyle().Bold(true).Foreground(colorInfo).
-			Render(fmt.Sprintf("%s (%d)", t, len(items))))
-		for _, v := range items {
-			sev := SeverityStyle(v.Severity).Render(fmt.Sprintf("[%s]", strings.ToUpper(v.Severity)))
-			lines = append(lines, truncateLine(fmt.Sprintf("  %s %s", sev, v.Details), width))
-		}
-		lines = append(lines, "")
-	}
-
-	windowed := m.scrollAndClamp(lines, height-2)
-	if len(windowed) == 0 {
-		windowed = []string{MutedStyle.Render("No vulnerabilities detected yet. First scan runs shortly after startup.")}
-	}
-	return lipgloss.JoinVertical(lipgloss.Left, header, joinLines(windowed))
-}
-
-func (m *Model) viewPorts(width, height int) string {
-	ports := m.store.OpenPorts()
-	header := SectionHeaderStyle.Render(fmt.Sprintf("Listening ports (%d)", len(ports)))
-
+	// Risky first, then new, then by port number.
 	sort.Slice(ports, func(i, j int) bool {
-		if (ports[i].Vulnerability != "") != (ports[j].Vulnerability != "") {
-			return ports[i].Vulnerability != ""
+		ri, rj := ports[i].Vulnerability != "", ports[j].Vulnerability != ""
+		if ri != rj {
+			return ri
+		}
+		if ports[i].New != ports[j].New {
+			return ports[i].New
 		}
 		return ports[i].Port < ports[j].Port
 	})
 
-	headerRow := TableHeaderStyle.Render(fmt.Sprintf("%-6s %-8s %-10s %-30s %s",
-		"PROTO", "PORT", "STATE", "PROCESS", "VULN"))
+	const layout = "%-5s %-15s %-7s %-9s %-22s %s"
+	columns := TableHeaderStyle.Render(fmt.Sprintf(layout,
+		"PROTO", "ADDRESS", "PORT", "STATE", "PROCESS", "NOTE"))
 
-	rows := []string{}
+	rows := make([]row, 0, len(ports))
 	for _, p := range ports {
-		vuln := p.Vulnerability
-		row := fmt.Sprintf("%-6s %-8s %-10s %-30s %s",
-			p.Protocol, p.Port, p.State, truncateLine(p.Process, 30), vuln)
-		if vuln != "" {
-			row = SeverityCriticalStyle.Render(row)
+		note := p.Vulnerability
+		if p.New {
+			if note != "" {
+				note = "NEW — " + note
+			} else {
+				note = "NEW since baseline"
+			}
 		}
-		rows = append(rows, truncateLine(row, width))
+		proc := fmt.Sprintf("%s(%d)", p.Process, p.PID)
+		plain := fmt.Sprintf(layout,
+			p.Protocol, clip(p.Address, 15), fmt.Sprintf("%d", p.Port),
+			clip(p.State, 9), clip(proc, 22), note)
+
+		styled := truncatePlain(plain, width)
+		switch {
+		case p.Vulnerability != "":
+			styled = SeverityCriticalStyle.Render(styled)
+		case p.New:
+			styled = SeverityWarningStyle.Render(styled)
+		}
+		rows = append(rows, row{plain: plain, styled: styled})
 	}
-	windowed := m.scrollAndClamp(rows, height-3)
-	if len(windowed) == 0 {
-		windowed = []string{MutedStyle.Render("No listening ports detected.")}
+
+	return tabView{
+		title:      fmt.Sprintf("Listening ports (%d)", len(ports)),
+		columns:    columns,
+		rows:       rows,
+		empty:      MutedStyle.Render("No listening ports detected."),
+		filterable: true,
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, header, headerRow, joinLines(windowed))
 }
 
-func (m *Model) viewConnections(width, height int) string {
-	conns := m.store.Connections()
-	header := SectionHeaderStyle.Render(
-		fmt.Sprintf("Outbound connections (%d) — where this host is reaching", len(conns)),
-	)
-
-	// Sort by remote address for stability
+func (m *Model) viewConnections(width, height int) tabView {
+	conns := m.snap.Connections
 	sort.Slice(conns, func(i, j int) bool {
+		if conns[i].New != conns[j].New {
+			return conns[i].New
+		}
 		return conns[i].RemoteAddr < conns[j].RemoteAddr
 	})
 
-	headerRow := TableHeaderStyle.Render(fmt.Sprintf("%-22s %-22s %-12s %-20s %s",
+	const layout = "%-22s %-24s %-12s %-18s %s"
+	columns := TableHeaderStyle.Render(fmt.Sprintf(layout,
 		"LOCAL", "REMOTE", "STATUS", "PROCESS", "HOSTNAME"))
 
-	rows := []string{}
+	rows := make([]row, 0, len(conns))
 	for _, c := range conns {
 		host := c.RemoteHost
 		if host == "" {
-			host = MutedStyle.Render("—")
+			host = "—"
 		}
 		proc := fmt.Sprintf("%s(%d)", c.Process, c.PID)
-		row := fmt.Sprintf("%-22s %-22s %-12s %-20s %s",
-			truncateLine(c.LocalAddr, 22),
-			truncateLine(c.RemoteAddr, 22),
-			truncateLine(c.Status, 12),
-			truncateLine(proc, 20),
-			host,
-		)
-		rows = append(rows, truncateLine(row, width))
+		plain := fmt.Sprintf(layout,
+			clip(c.LocalAddr, 22), clip(c.RemoteAddr, 24), clip(c.Status, 12),
+			clip(proc, 18), host)
+
+		styled := truncatePlain(plain, width)
+		if c.New {
+			styled = SeverityWarningStyle.Render(styled)
+		}
+		rows = append(rows, row{plain: plain, styled: styled})
 	}
-	windowed := m.scrollAndClamp(rows, height-3)
-	if len(windowed) == 0 {
-		windowed = []string{MutedStyle.Render("No outbound connections observed yet.")}
+
+	return tabView{
+		title: fmt.Sprintf("Outbound connections (%d) — where this host is reaching",
+			len(conns)),
+		columns:    columns,
+		rows:       rows,
+		empty:      MutedStyle.Render("No outbound connections observed yet."),
+		filterable: true,
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, header, headerRow, joinLines(windowed))
 }
 
-func truncateLine(s string, n int) string {
+func clip(s string, n int) string {
 	if n <= 0 {
 		return ""
 	}
-	if strings.Contains(s, "\x1b") {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	if len(s) <= n {
+	if n <= 1 {
+		return string(r[:n])
+	}
+	return string(r[:n-1]) + "…"
+}
+
+func truncatePlain(s string, n int) string { return clip(s, n) }
+
+func visibleWidth(s string) int {
+	n := 0
+	state := escNone
+	for _, r := range s {
+		if next, consumed := stepEscape(state, r); consumed {
+			state = next
+			continue
+		}
+		state = escNone
+		n++
+	}
+	return n
+}
+
+const (
+	escNone = iota
+	escSeen
+	escCSI
+)
+
+func stepEscape(state int, r rune) (int, bool) {
+	switch state {
+	case escSeen:
+		if r == '[' {
+			return escCSI, true
+		}
+
+		return escNone, true
+	case escCSI:
+		if r >= 0x40 && r <= 0x7E {
+			return escNone, true
+		}
+		return escCSI, true
+	default:
+		if r == 0x1b {
+			return escSeen, true
+		}
+		return escNone, false
+	}
+}
+
+func truncateStyled(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if visibleWidth(s) <= n {
 		return s
 	}
-	if n <= 3 {
-		return s[:n]
+
+	var b strings.Builder
+	visible := 0
+	state := escNone
+	sawEscape := false
+
+	for _, r := range s {
+		if next, consumed := stepEscape(state, r); consumed {
+			state = next
+			sawEscape = true
+			b.WriteRune(r)
+			continue
+		}
+		state = escNone
+		if visible >= n-1 {
+			b.WriteRune('…')
+			break
+		}
+		b.WriteRune(r)
+		visible++
 	}
-	return s[:n-3] + "..."
+
+	if sawEscape {
+		b.WriteString("\x1b[0m")
+	}
+	return b.String()
+}
+
+func compileFilter(query string) (*regexp.Regexp, bool) {
+	if !strings.HasPrefix(query, "re:") {
+		return nil, false
+	}
+	expr := strings.TrimPrefix(query, "re:")
+	if expr == "" {
+		return nil, false
+	}
+	re, err := regexp.Compile("(?i)" + expr)
+	if err != nil {
+		return nil, false
+	}
+	return re, true
+}
+
+func matchRows(rows []row, query string) []row {
+	if query == "" {
+		return rows
+	}
+
+	if re, ok := compileFilter(query); ok {
+		out := rows[:0:0]
+		for _, r := range rows {
+			if re.MatchString(r.plain) {
+				out = append(out, r)
+			}
+		}
+		return out
+	}
+
+	needle := query
+	fold := needle == strings.ToLower(needle)
+	if fold {
+		needle = strings.ToLower(needle)
+	}
+
+	out := rows[:0:0]
+	for _, r := range rows {
+		hay := r.plain
+		if fold {
+			hay = strings.ToLower(hay)
+		}
+		if strings.Contains(hay, needle) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func relativeAge(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	default:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	}
 }
